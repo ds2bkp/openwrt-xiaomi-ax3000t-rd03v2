@@ -1,0 +1,138 @@
+{
+  "kernel_dependency": "6.12.94~d48f5cedc0894cabda641d4947dcee08-r1",
+  "packages": [
+    {
+      "name": "kmod-wireguard",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-wireguard-6.12.94-r1.apk",
+      "sha256": "94e95712dab747ec403e2e502103a2f09372b2c0c0a5d808b3f0fb470426ba0c",
+      "bytes": 31895,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1",
+        "kmod-crypto-lib-chacha20poly1305",
+        "kmod-crypto-lib-curve25519",
+        "kmod-udptunnel4",
+        "kmod-udptunnel6"
+      ]
+    },
+    {
+      "name": "wireguard-tools",
+      "version": "1.0.20260223-r1",
+      "file": "packages/wireguard-tools-1.0.20260223-r1.apk",
+      "sha256": "001bdbceeb149c6808856f169a661f1b54b4f3b77c9874530f65512c3038ab24",
+      "bytes": 28833,
+      "depends": [
+        "kmod-wireguard",
+        "libc"
+      ]
+    },
+    {
+      "name": "luci-proto-wireguard",
+      "version": "26.263.50874~7c91cb2",
+      "file": "packages/luci-proto-wireguard-26.263.50874~7c91cb2.apk",
+      "sha256": "f34501e3de7a7190ea866a591f4e95f3d5d3c4bbccff8024ed6af766f7bd334f",
+      "bytes": 12175,
+      "depends": [
+        "libc",
+        "luci-lib-uqr",
+        "resolveip",
+        "ucode",
+        "wireguard-tools"
+      ]
+    },
+    {
+      "name": "kmod-crypto-lib-chacha20",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-crypto-lib-chacha20-6.12.94-r1.apk",
+      "sha256": "13e210b1b151d9db2ffa678631bb8729adf39aaf3cc348a5288d297ba977c888",
+      "bytes": 5941,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1"
+      ]
+    },
+    {
+      "name": "kmod-crypto-lib-chacha20poly1305",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-crypto-lib-chacha20poly1305-6.12.94-r1.apk",
+      "sha256": "3abbb57cfb641cf98e1162d3c0d352104bbd581ac1304a3929f7e39b4be011d1",
+      "bytes": 3960,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1",
+        "kmod-crypto-lib-chacha20",
+        "kmod-crypto-lib-poly1305"
+      ]
+    },
+    {
+      "name": "kmod-crypto-lib-curve25519",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-crypto-lib-curve25519-6.12.94-r1.apk",
+      "sha256": "39b81e882b50f3b6fde4fa12ca2b8902dcefb55c1ecd2b370ef963825006e5cf",
+      "bytes": 18036,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1",
+        "kmod-crypto-kpp"
+      ]
+    },
+    {
+      "name": "kmod-crypto-lib-poly1305",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-crypto-lib-poly1305-6.12.94-r1.apk",
+      "sha256": "2370de8cf200f1d83ab6f096dce6a3ffc24de0860f1361ef3cad228dab4a6738",
+      "bytes": 5230,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1",
+        "kmod-crypto-hash"
+      ]
+    },
+    {
+      "name": "kmod-crypto-kpp",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-crypto-kpp-6.12.94-r1.apk",
+      "sha256": "d3d147e7ee4b8316a0355fbf946baa4ae4460cb2dcc4b486f24974254c46fe63",
+      "bytes": 792,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1"
+      ]
+    },
+    {
+      "name": "kmod-udptunnel4",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-udptunnel4-6.12.94-r1.apk",
+      "sha256": "dcc87ed0d15c05bbb036a0865bc148cf84fb6d643391175cd25325ab33d288c6",
+      "bytes": 8816,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1"
+      ]
+    },
+    {
+      "name": "kmod-udptunnel6",
+      "version": "6.12.94-r1",
+      "file": "packages/kmod-udptunnel6-6.12.94-r1.apk",
+      "sha256": "c8bde71e33b66d8d8af6e983eb848c88f405b1a76f9268f1df183a2cf65da4b8",
+      "bytes": 3485,
+      "depends": [
+        "kernel=6.12.94~d48f5cedc0894cabda641d4947dcee08-r1"
+      ]
+    },
+    {
+      "name": "luci-lib-uqr",
+      "version": "26.263.50874~7c91cb2",
+      "file": "packages/luci-lib-uqr-26.263.50874~7c91cb2.apk",
+      "sha256": "61f82494004439ad837e76cd90994b3f1d3c3278c2ad742ed304c5b9cbf2ab0d",
+      "bytes": 5592,
+      "depends": [
+        "libc"
+      ]
+    },
+    {
+      "name": "resolveip",
+      "version": "2",
+      "file": "packages/resolveip-2.apk",
+      "sha256": "fea2ddda609e71ec40325427d165e9c8b440de5a29276f8f5402fcaf566b0495",
+      "bytes": 2549,
+      "depends": [
+        "libc"
+      ]
+    }
+  ]
+}
