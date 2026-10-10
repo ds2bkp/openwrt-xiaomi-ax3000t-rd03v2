@@ -1,0 +1,543 @@
+mroute: use BH-safe locks for packet-path offload readers
+
+Pin offload lookups with RCU; notify route additions and bulk deletion,
+and notify before releasing the IPv4 cache reference.
+
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -95,7 +95,7 @@
+ 
+ /* We return to original Alan's scheme. Hash table of resolved
+  * entries is changed only in process context and protected
+- * with weak lock mrt_lock. Queue of unresolved entries is protected
++ * with BH-safe lock mrt_lock. Queue of unresolved entries is protected
+  * with strong spinlock mfc_unres_lock.
+  *
+  * In this case data path is free of exclusive locks at all.
+@@ -260,25 +260,25 @@
+ 	origin = cache->mfc_origin;
+ 	group = cache->mfc_mcastgrp;
+ 
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	for (vifi = 0; vifi < cache->_c.mfc_un.res.maxvif; vifi++) {
+ 		if (!((cache->_c.mfc_un.res.ttls[vifi] > 0) &&
+ 		      (cache->_c.mfc_un.res.ttls[vifi] < 255))) {
+ 			continue;
+ 		}
+ 		if (dest_if_count == MAXVIFS) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
+ 			return;
+ 		}
+ 
+ 		if (!VIF_EXISTS(mrt, vifi)) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
+ 			return;
+ 		}
+ 		dest_dev[dest_if_count] = mrt->vif_table[vifi].dev->ifindex;
+ 		dest_if_count++;
+ 	}
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 
+ 	rcu_read_lock();
+ 	offload_update_cb_f = rcu_dereference(ipmr_mfc_event_offload_callback);
+@@ -334,21 +334,15 @@
+ bool ipmr_register_mfc_event_offload_callback(
+ 		ipmr_mfc_event_offload_callback_t mfc_offload_cb)
+ {
+-	ipmr_mfc_event_offload_callback_t offload_update_cb_f;
+-
+-	rcu_read_lock();
+-	offload_update_cb_f = rcu_dereference(ipmr_mfc_event_offload_callback);
+-
+-	if (offload_update_cb_f) {
+-		rcu_read_unlock();
++	if (!mfc_offload_cb)
+ 		return false;
+-	}
+-	rcu_read_unlock();
+-
+-	spin_lock(&lock);
++	spin_lock_bh(&lock);
++	if (rcu_access_pointer(ipmr_mfc_event_offload_callback)) {
++		spin_unlock_bh(&lock);
++		return false;
++	}
+ 	rcu_assign_pointer(ipmr_mfc_event_offload_callback, mfc_offload_cb);
+-	spin_unlock(&lock);
+-	synchronize_rcu();
++	spin_unlock_bh(&lock);
+ 	return true;
+ }
+ EXPORT_SYMBOL(ipmr_register_mfc_event_offload_callback);
+@@ -358,9 +352,9 @@
+  */
+ void ipmr_unregister_mfc_event_offload_callback(void)
+ {
+-	spin_lock(&lock);
++	spin_lock_bh(&lock);
+ 	rcu_assign_pointer(ipmr_mfc_event_offload_callback, NULL);
+-	spin_unlock(&lock);
++	spin_unlock_bh(&lock);
+ 	synchronize_rcu();
+ }
+ EXPORT_SYMBOL(ipmr_unregister_mfc_event_offload_callback);
+@@ -376,18 +370,19 @@
+ 	struct mr_table *mrt;
+ 	struct mfc_cache *cache;
+ 
++	rcu_read_lock();
+ 	mrt = ipmr_get_table(net, RT_TABLE_DEFAULT);
+-	if (!mrt)
++	if (!mrt) {
++		rcu_read_unlock();
+ 		return -ENOENT;
+-
+-	rcu_read_lock();
++	}
+ 	cache = ipmr_cache_find(mrt, origin, group);
+ 	if (!cache) {
+ 		rcu_read_unlock();
+ 		return -ENOENT;
+ 	}
+ 
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	for (vifi = 0; vifi < cache->_c.mfc_un.res.maxvif; vifi++) {
+ 		if (!((cache->_c.mfc_un.res.ttls[vifi] > 0) &&
+ 		      (cache->_c.mfc_un.res.ttls[vifi] < 255))) {
+@@ -399,13 +394,13 @@
+ 		 * exceeding the size of the array given to us
+ 		 */
+ 		if (dest_if_count == max_dest_cnt) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
+ 			rcu_read_unlock();
+ 			return -EINVAL;
+ 		}
+ 
+ 		if (!VIF_EXISTS(mrt, vifi)) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
+ 			rcu_read_unlock();
+ 			return -EINVAL;
+ 		}
+@@ -413,7 +408,7 @@
+ 		dest_dev[dest_if_count] = mrt->vif_table[vifi].dev->ifindex;
+ 		dest_if_count++;
+ 	}
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 	rcu_read_unlock();
+ 
+ 	return dest_if_count;
+@@ -431,11 +426,12 @@
+ 	struct mr_table *mrt;
+ 	struct mfc_cache *cache;
+ 
++	rcu_read_lock();
+ 	mrt = ipmr_get_table(net, RT_TABLE_DEFAULT);
+-	if (!mrt)
++	if (!mrt) {
++		rcu_read_unlock();
+ 		return -ENOENT;
+-
+-	rcu_read_lock();
++	}
+ 	cache = ipmr_cache_find(mrt, origin, group);
+ 	if (!cache) {
+ 		rcu_read_unlock();
+@@ -444,9 +440,9 @@
+ 
+ 	vif = cache->_c.mfc_parent;
+ 
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	if (!VIF_EXISTS(mrt, vif)) {
+-		spin_unlock(&mrt_lock);
++		spin_unlock_bh(&mrt_lock);
+ 		rcu_read_unlock();
+ 		return -EINVAL;
+ 	}
+@@ -461,7 +457,7 @@
+ 		if ((cache->_c.mfc_un.res.ttls[vifi] > 0) &&
+ 		    (cache->_c.mfc_un.res.ttls[vifi] < 255)) {
+ 			if (!VIF_EXISTS(mrt, vifi)) {
+-				spin_unlock(&mrt_lock);
++				spin_unlock_bh(&mrt_lock);
+ 				rcu_read_unlock();
+ 				return -EINVAL;
+ 			}
+@@ -469,7 +465,7 @@
+ 			mrt->vif_table[vifi].bytes_out += bytes_out;
+ 		}
+ 	}
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 	rcu_read_unlock();
+ 
+ 	return 0;
+@@ -907,7 +903,7 @@
+ 	if (!dev)
+ 		return -EADDRNOTAVAIL;
+ 
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	call_ipmr_vif_entry_notifiers(net, FIB_EVENT_VIF_DEL, v, dev,
+ 				      vifi, mrt->id);
+ 	RCU_INIT_POINTER(v->dev, NULL);
+@@ -926,7 +922,7 @@
+ 		WRITE_ONCE(mrt->maxvif, tmp + 1);
+ 	}
+ 
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 
+ 	dev_set_allmulti(dev, -1);
+ 
+@@ -1140,7 +1136,7 @@
+ 	v->remote = vifc->vifc_rmt_addr.s_addr;
+ 
+ 	/* And finish update writing critical data */
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	rcu_assign_pointer(v->dev, dev);
+ 	netdev_tracker_alloc(dev, &v->dev_tracker, GFP_ATOMIC);
+ 	if (v->flags & VIFF_REGISTER) {
+@@ -1149,7 +1145,7 @@
+ 	}
+ 	if (vifi+1 > mrt->maxvif)
+ 		WRITE_ONCE(mrt->maxvif, vifi + 1);
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 	call_ipmr_vif_entry_notifiers(net, FIB_EVENT_VIF_ADD, v, dev,
+ 				      vifi, mrt->id);
+ 	return 0;
+@@ -1433,11 +1429,11 @@
+ 	list_del_rcu(&c->_c.list);
+ 	call_ipmr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_DEL, c, mrt->id);
+ 	mroute_netlink_event(mrt, c, RTM_DELROUTE);
+-	mr_cache_put(&c->_c);
+ 	/* QCA ECM qca-mcs support - Start */
+ 	/* Inform offload modules of the delete event */
+ 	ipmr_sync_entry_delete(c->mfc_origin, c->mfc_mcastgrp);
+ 	/* QCA ECM qca-mcs support - End */
++	mr_cache_put(&c->_c);
+ 
+ 	return 0;
+ }
+@@ -1459,12 +1455,12 @@
+ 				   mfc->mfcc_mcastgrp.s_addr, parent);
+ 	rcu_read_unlock();
+ 	if (c) {
+-		spin_lock(&mrt_lock);
++		spin_lock_bh(&mrt_lock);
+ 		c->_c.mfc_parent = mfc->mfcc_parent;
+ 		ipmr_update_thresholds(mrt, &c->_c, mfc->mfcc_ttls);
+ 		if (!mrtsock)
+ 			c->_c.mfc_flags |= MFC_STATIC;
+-		spin_unlock(&mrt_lock);
++		spin_unlock_bh(&mrt_lock);
+ 		call_ipmr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_REPLACE, c,
+ 					      mrt->id);
+ 		mroute_netlink_event(mrt, c, RTM_NEWROUTE);
+@@ -1523,6 +1519,7 @@
+ 	}
+ 	call_ipmr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_ADD, c, mrt->id);
+ 	mroute_netlink_event(mrt, c, RTM_NEWROUTE);
++	ipmr_sync_entry_update(mrt, c);
+ 	return 0;
+ }
+ 
+@@ -1559,6 +1556,7 @@
+ 			call_ipmr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_DEL, cache,
+ 						      mrt->id);
+ 			mroute_netlink_event(mrt, cache, RTM_DELROUTE);
++			ipmr_sync_entry_delete(cache->mfc_origin, cache->mfc_mcastgrp);
+ 			mr_cache_put(c);
+ 		}
+ 	}
+--- a/net/ipv6/ip6mr.c
++++ b/net/ipv6/ip6mr.c
+@@ -413,7 +413,7 @@
+ 
+ 	memset(dest_dev, 0, sizeof(dest_dev));
+ 
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 
+ 	for (vifi = 0; vifi < cache->_c.mfc_un.res.maxvif; vifi++) {
+ 		if (!((cache->_c.mfc_un.res.ttls[vifi] > 0) &&
+@@ -422,12 +422,12 @@
+ 		}
+ 
+ 		if (dest_if_count == MAXMIFS) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
+ 			return;
+ 		}
+ 
+ 		if (!VIF_EXISTS(mrt, vifi)) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
+ 			return;
+ 		}
+ 
+@@ -437,7 +437,7 @@
+ 
+ 	memcpy(&mc_origin, &cache->mf6c_origin, sizeof(struct in6_addr));
+ 	memcpy(&mc_group, &cache->mf6c_mcastgrp, sizeof(struct in6_addr));
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 
+ 	rcu_read_lock();
+ 	offload_update_cb_f = rcu_dereference(ip6mr_mfc_event_offload_callback);
+@@ -806,21 +806,15 @@
+ bool ip6mr_register_mfc_event_offload_callback(
+ 		ip6mr_mfc_event_offload_callback_t mfc_offload_cb)
+ {
+-	ip6mr_mfc_event_offload_callback_t offload_update_cb_f;
+-
+-	rcu_read_lock();
+-	offload_update_cb_f = rcu_dereference(ip6mr_mfc_event_offload_callback);
+-
+-	if (offload_update_cb_f) {
+-		rcu_read_unlock();
++	if (!mfc_offload_cb)
+ 		return false;
+-	}
+-	rcu_read_unlock();
+-
+-	spin_lock(&lock);
++	spin_lock_bh(&lock);
++	if (rcu_access_pointer(ip6mr_mfc_event_offload_callback)) {
++		spin_unlock_bh(&lock);
++		return false;
++	}
+ 	rcu_assign_pointer(ip6mr_mfc_event_offload_callback, mfc_offload_cb);
+-	spin_unlock(&lock);
+-	synchronize_rcu();
++	spin_unlock_bh(&lock);
+ 	return true;
+ }
+ EXPORT_SYMBOL(ip6mr_register_mfc_event_offload_callback);
+@@ -830,9 +824,9 @@
+  */
+ void ip6mr_unregister_mfc_event_offload_callback(void)
+ {
+-	spin_lock(&lock);
++	spin_lock_bh(&lock);
+ 	rcu_assign_pointer(ip6mr_mfc_event_offload_callback, NULL);
+-	spin_unlock(&lock);
++	spin_unlock_bh(&lock);
+ 	synchronize_rcu();
+ }
+ EXPORT_SYMBOL(ip6mr_unregister_mfc_event_offload_callback);
+@@ -849,14 +843,18 @@
+ 	struct mr_table *mrt;
+ 	struct mfc6_cache *cache;
+ 
++	rcu_read_lock();
+ 	mrt = ip6mr_get_table(net, RT6_TABLE_DFLT);
+-	if (!mrt)
++	if (!mrt) {
++		rcu_read_unlock();
+ 		return -ENOENT;
+-
+-	spin_lock(&mrt_lock);
++	}
++
++	spin_lock_bh(&mrt_lock);
+ 	cache = ip6mr_cache_find(mrt, origin, group);
+ 	if (!cache) {
+-		spin_unlock(&mrt_lock);
++		spin_unlock_bh(&mrt_lock);
++		rcu_read_unlock();
+ 		return -ENOENT;
+ 	}
+ 
+@@ -871,19 +869,22 @@
+ 		 * exceeding the size of the array given to us
+ 		 */
+ 		if (dest_if_count == max_dest_cnt) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
++			rcu_read_unlock();
+ 			return -EINVAL;
+ 		}
+ 
+ 		if (!VIF_EXISTS(mrt, vifi)) {
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
++			rcu_read_unlock();
+ 			return -EINVAL;
+ 		}
+ 
+ 		dest_dev[dest_if_count] = mrt->vif_table[vifi].dev->ifindex;
+ 		dest_if_count++;
+ 	}
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
++	rcu_read_unlock();
+ 
+ 	return dest_if_count;
+ }
+@@ -901,22 +902,27 @@
+ 	struct mr_table *mrt;
+ 	struct mfc6_cache *cache;
+ 
++	rcu_read_lock();
+ 	mrt = ip6mr_get_table(net, RT6_TABLE_DFLT);
+ 
+-	if (!mrt)
++	if (!mrt) {
++		rcu_read_unlock();
+ 		return -ENOENT;
+-
+-	spin_lock(&mrt_lock);
++	}
++
++	spin_lock_bh(&mrt_lock);
+ 	cache = ip6mr_cache_find(mrt, origin, group);
+ 	if (!cache) {
+-		spin_unlock(&mrt_lock);
++		spin_unlock_bh(&mrt_lock);
++		rcu_read_unlock();
+ 		return -ENOENT;
+ 	}
+ 
+ 	vif = cache->_c.mfc_parent;
+ 
+ 	if (!VIF_EXISTS(mrt, vif)) {
+-		spin_unlock(&mrt_lock);
++		spin_unlock_bh(&mrt_lock);
++		rcu_read_unlock();
+ 		return -EINVAL;
+ 	}
+ 
+@@ -930,7 +936,8 @@
+ 		if ((cache->_c.mfc_un.res.ttls[vifi] > 0) &&
+ 		    (cache->_c.mfc_un.res.ttls[vifi] < 255)) {
+ 			if (!VIF_EXISTS(mrt, vifi)) {
+-				spin_unlock(&mrt_lock);
++				spin_unlock_bh(&mrt_lock);
++				rcu_read_unlock();
+ 				return -EINVAL;
+ 			}
+ 			mrt->vif_table[vifi].pkt_out += pkts_out;
+@@ -938,7 +945,8 @@
+ 		}
+ 	}
+ 
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
++	rcu_read_unlock();
+ 	return 0;
+ }
+ EXPORT_SYMBOL(ip6mr_mfc_stats_update);
+@@ -964,7 +972,7 @@
+ 	call_ip6mr_vif_entry_notifiers(read_pnet(&mrt->net),
+ 				       FIB_EVENT_VIF_DEL, v, dev,
+ 				       vifi, mrt->id);
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	RCU_INIT_POINTER(v->dev, NULL);
+ 
+ #ifdef CONFIG_IPV6_PIMSM_V2
+@@ -983,7 +991,7 @@
+ 		WRITE_ONCE(mrt->maxvif, tmp + 1);
+ 	}
+ 
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 
+ 	dev_set_allmulti(dev, -1);
+ 
+@@ -1169,7 +1177,7 @@
+ 			MIFF_REGISTER);
+ 
+ 	/* And finish update writing critical data */
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	rcu_assign_pointer(v->dev, dev);
+ 	netdev_tracker_alloc(dev, &v->dev_tracker, GFP_ATOMIC);
+ #ifdef CONFIG_IPV6_PIMSM_V2
+@@ -1178,7 +1186,7 @@
+ #endif
+ 	if (vifi + 1 > mrt->maxvif)
+ 		WRITE_ONCE(mrt->maxvif, vifi + 1);
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 	call_ip6mr_vif_entry_notifiers(net, FIB_EVENT_VIF_ADD,
+ 				       v, dev, vifi, mrt->id);
+ 	return 0;
+@@ -1703,12 +1711,12 @@
+ 				    &mfc->mf6cc_mcastgrp.sin6_addr, parent);
+ 	rcu_read_unlock();
+ 	if (c) {
+-		spin_lock(&mrt_lock);
++		spin_lock_bh(&mrt_lock);
+ 		c->_c.mfc_parent = mfc->mf6cc_parent;
+ 		ip6mr_update_thresholds(mrt, &c->_c, ttls);
+ 		if (!mrtsock)
+ 			c->_c.mfc_flags |= MFC_STATIC;
+-		spin_unlock(&mrt_lock);
++		spin_unlock_bh(&mrt_lock);
+ 		call_ip6mr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_REPLACE,
+ 					       c, mrt->id);
+ 		mr6_netlink_event(mrt, c, RTM_NEWROUTE);
+@@ -1769,6 +1777,7 @@
+ 	call_ip6mr_mfc_entry_notifiers(net, FIB_EVENT_ENTRY_ADD,
+ 				       c, mrt->id);
+ 	mr6_netlink_event(mrt, c, RTM_NEWROUTE);
++	ip6mr_sync_entry_update(mrt, c);
+ 	return 0;
+ }
+ 
+@@ -1806,6 +1815,8 @@
+ 						       FIB_EVENT_ENTRY_DEL,
+ 						       (struct mfc6_cache *)c, mrt->id);
+ 			mr6_netlink_event(mrt, (struct mfc6_cache *)c, RTM_DELROUTE);
++			ip6mr_sync_entry_delete(&((struct mfc6_cache *)c)->mf6c_origin,
++					       &((struct mfc6_cache *)c)->mf6c_mcastgrp);
+ 			mr_cache_put(c);
+ 		}
+ 	}
+@@ -1830,7 +1841,7 @@
+ 	struct net *net = sock_net(sk);
+ 
+ 	rtnl_lock();
+-	spin_lock(&mrt_lock);
++	spin_lock_bh(&mrt_lock);
+ 	if (rtnl_dereference(mrt->mroute_sk)) {
+ 		err = -EADDRINUSE;
+ 	} else {
+@@ -1838,7 +1849,7 @@
+ 		sock_set_flag(sk, SOCK_RCU_FREE);
+ 		atomic_inc(&net->ipv6.devconf_all->mc_forwarding);
+ 	}
+-	spin_unlock(&mrt_lock);
++	spin_unlock_bh(&mrt_lock);
+ 
+ 	if (!err)
+ 		inet6_netconf_notify_devconf(net, RTM_NEWNETCONF,
+@@ -1868,14 +1879,14 @@
+ 	rtnl_lock();
+ 	ip6mr_for_each_table(mrt, net) {
+ 		if (sk == rtnl_dereference(mrt->mroute_sk)) {
+-			spin_lock(&mrt_lock);
++			spin_lock_bh(&mrt_lock);
+ 			RCU_INIT_POINTER(mrt->mroute_sk, NULL);
+ 			/* Note that mroute_sk had SOCK_RCU_FREE set,
+ 			 * so the RCU grace period before sk freeing
+ 			 * is guaranteed by sk_destruct()
+ 			 */
+ 			atomic_dec(&devconf->mc_forwarding);
+-			spin_unlock(&mrt_lock);
++			spin_unlock_bh(&mrt_lock);
+ 			inet6_netconf_notify_devconf(net, RTM_NEWNETCONF,
+ 						     NETCONFA_MC_FORWARDING,
+ 						     NETCONFA_IFINDEX_ALL,

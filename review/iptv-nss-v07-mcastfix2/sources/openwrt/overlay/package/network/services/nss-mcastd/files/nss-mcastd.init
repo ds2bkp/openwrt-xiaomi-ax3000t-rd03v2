@@ -1,0 +1,49 @@
+#!/bin/sh /etc/rc.common
+START=95
+STOP=10
+USE_PROCD=1
+
+find_downstream() {
+ local section="$1" direction network device
+ config_get direction "$section" direction
+ [ "$direction" = downstream ] || return 0
+ config_get network "$section" network
+ [ -n "$network" ] || return 0
+ device="$(ubus call network.interface."$network" status 2>/dev/null | jsonfilter -e '@.l3_device')"
+ [ -n "$device" ] && [ -d "/sys/class/net/$device/bridge" ] || return 0
+ append mcast_bridges "$device"
+}
+
+start_service() {
+ local mcast_bridges=""
+ [ -e /proc/net/mcastd/snooper ] || return 0
+ [ "$(cat /sys/module/qca_mcs/parameters/observe_only 2>/dev/null)" = Y ] || return 0
+ config_load igmpproxy
+ config_foreach find_downstream phyint
+ [ -n "$mcast_bridges" ] || return 0
+ procd_open_instance
+ procd_set_param command /usr/sbin/nss-mcastd
+ for device in $mcast_bridges; do procd_append_param command "$device"; done
+ procd_set_param respawn 3600 5 3
+ procd_set_param term_timeout 20
+ procd_close_instance
+}
+
+reload_service() {
+ stop
+ start
+}
+
+add_downstream_trigger() {
+ local direction network
+ config_get direction "$1" direction
+ config_get network "$1" network
+ [ "$direction" = downstream ] && [ -n "$network" ] || return 0
+ procd_add_interface_trigger "interface.*" "$network" /etc/init.d/nss-mcastd reload
+}
+
+service_triggers() {
+ procd_add_reload_trigger igmpproxy
+ config_load igmpproxy
+ config_foreach add_downstream_trigger phyint
+}

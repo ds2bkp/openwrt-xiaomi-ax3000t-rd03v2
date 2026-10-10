@@ -1,0 +1,176 @@
+qca-mcs: observe membership without replacing Linux forwarding
+
+Keep the software bridge working while ECM learns destination interfaces.
+Bound the netlink payload and flood/encapsulation copies.
+
+--- a/mc_forward.c
++++ b/mc_forward.c
+@@ -14,6 +14,9 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
+ #include <linux/init.h>
+ #include <linux/spinlock.h>
+ #include <linux/err.h>
+@@ -31,6 +34,14 @@
+ 
+ int mc_forward_init(void) __maybe_unused;
+ void mc_forward_exit(void) __maybe_unused;
++
++/*
++ * Observe IGMP/MLD for ECM but leave forwarding to the Linux bridge.
++ * An empty/unavailable offload table must never interrupt IPTV.
++ */
++static bool observe_only = true;
++module_param(observe_only, bool, 0444);
++MODULE_PARM_DESC(observe_only, "Snoop control traffic without consuming multicast packets");
+ 
+ static void mc_retag(void *iph, __be16 etype, __be32 dscp)
+ {
+@@ -467,6 +478,8 @@
+ 		return -EINVAL;
+ 
+ 	if (!src) {
++		if (observe_only)
++			return -EINVAL;
+ 		ret = mc_convert(mc, skb, 0);
+ 		return ret;
+ 	}
+@@ -475,6 +488,37 @@
+ 	fdb = os_br_fdb_get(br, eth_hdr(skb)->h_source);
+ 	if (!fdb)
+ 		return -EINVAL;
++
++	if (observe_only) {
++		struct sk_buff *copy;
++		struct iphdr ipbuf, *ip;
++		struct ipv6hdr ip6buf, *ip6;
++		__be16 proto = eth_hdr(skb)->h_proto;
++
++		/* Do not allocate/copy IPTV UDP packets on the data path. */
++		if (proto == htons(ETH_P_IP)) {
++			ip = skb_header_pointer(skb, skb_network_offset(skb), sizeof(ipbuf), &ipbuf);
++			if (!ip || ip->protocol != IPPROTO_IGMP)
++				return -EINVAL;
++		} else if (proto == htons(ETH_P_IPV6)) {
++			ip6 = skb_header_pointer(skb, skb_network_offset(skb), sizeof(ip6buf), &ip6buf);
++			if (!ip6 || (ip6->nexthdr != IPPROTO_HOPOPTS &&
++				     ip6->nexthdr != IPPROTO_ICMPV6))
++				return -EINVAL;
++		} else {
++			return -EINVAL;
++		}
++		copy = skb_copy(skb, GFP_ATOMIC);
++		if (copy) {
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
++			mc_rcv(mc, copy, fdb->key.addr.addr, src->dev);
++#else
++			mc_rcv(mc, copy, fdb->addr.addr, src->dev);
++#endif
++			kfree_skb(copy);
++		}
++		return -EINVAL;
++	}
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0))
+ 	if (mc_rcv(mc, skb, fdb->key.addr.addr, src->dev)) {
+--- a/mc_netlink.c
++++ b/mc_netlink.c
+@@ -19,6 +19,7 @@
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+ #include <linux/etherdevice.h>
++#include <linux/capability.h>
+ 
+ #include "mc_osdep.h"
+ #include "mc_api.h"
+@@ -506,7 +507,7 @@
+ 			if (entry_cnt && ((entry = mc_find_entry_by_mdb(mc, mdb,
+ 								sizeof(struct __mc_encaptbl_entry), param, param_len)) != NULL)) {
+ 				mdb->encap_dev_cnt = entry->dev_cnt > MC_ENCAP_DEV_MAX ? MC_ENCAP_DEV_MAX : entry->dev_cnt;
+-				memcpy(mdb->encap_dev, entry->dev,	entry->dev_cnt * sizeof(struct __mc_encaptbl_dev));
++				memcpy(mdb->encap_dev, entry->dev,	mdb->encap_dev_cnt * sizeof(struct __mc_encaptbl_dev));
+ 			} else {
+ 				mdb->encap_dev_cnt = 0;
+ 				memset(mdb->encap_dev, 0,  sizeof(mdb->encap_dev));
+@@ -541,9 +542,9 @@
+ 				flood_ifcnt = mdb->flood_ifcnt;
+ 				mdb->flood_ifcnt = entry->ifcnt > MC_FLOOD_IF_MAX ? MC_FLOOD_IF_MAX : entry->ifcnt;
+ 				if (flood_ifcnt != mdb->flood_ifcnt ||
+-					memcmp(mdb->flood_ifindex, entry->ifindex, entry->ifcnt * sizeof(__be32)))
++					memcmp(mdb->flood_ifindex, entry->ifindex, mdb->flood_ifcnt * sizeof(__be32)))
+ 					entry_changed = 1;
+-				memcpy(mdb->flood_ifindex, entry->ifindex, entry->ifcnt * sizeof(__be32));
++				memcpy(mdb->flood_ifindex, entry->ifindex, mdb->flood_ifcnt * sizeof(__be32));
+ 			} else {
+ 				if (mdb->flood_ifcnt != 0)
+ 					entry_changed = 1;
+@@ -574,6 +575,48 @@
+ 	struct __mcctl_msg_header *msghdr;
+ 	struct mc_struct *mc = NULL;
+ 
++	/* Netlink payload lengths and sender identity are not trustworthy. */
++	if (!netlink_capable(__skb, CAP_NET_ADMIN) ||
++	    __skb->len < NLMSG_LENGTH(MC_MSG_HDRLEN))
++		return;
++	nlh = nlmsg_hdr(__skb);
++	if (!nlmsg_ok(nlh, __skb->len) || nlh->nlmsg_len < NLMSG_LENGTH(MC_MSG_HDRLEN))
++		return;
++	msghdr = NLMSG_DATA(nlh);
++	if (!memchr(msghdr->if_name, '\0', IFNAMSIZ) ||
++	    msghdr->buf_len > nlh->nlmsg_len - NLMSG_LENGTH(MC_MSG_HDRLEN))
++		return;
++	switch (nlh->nlmsg_type) {
++	case MC_MSG_GET_ACL:
++	case MC_MSG_GET_MDB:
++	case MC_MSG_GET_ROUTER_PORT:
++		break;
++	case MC_MSG_SET_PSW_FLOOD:
++		if (msghdr->buf_len % sizeof(struct __mc_floodtbl_entry))
++			return;
++		break;
++	case MC_MSG_SET_PSW_ENCAP:
++		if (msghdr->buf_len % sizeof(struct __mc_encaptbl_entry))
++			return;
++		break;
++	case MC_MSG_SET_RETAG:
++	case MC_MSG_SET_ROUTER_PORT:
++	case MC_MSG_SET_TIMEOUT:
++		if (msghdr->buf_len < 8)
++			return;
++		break;
++	case MC_MSG_SET_ADD_ACL_RULE:
++		if (msghdr->buf_len < sizeof(struct __mc_param_acl_rule))
++			return;
++		break;
++	case MC_MSG_DEL_MDB:
++		if (msghdr->buf_len < sizeof(struct __mc_mdb_entry))
++			return;
++		break;
++	default:
++		if (nlh->nlmsg_type >= MC_MSG_MAX || msghdr->buf_len < 4)
++			return;
++	}
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0))
+ 	if ((skb = skb_clone(__skb, GFP_ATOMIC)) == NULL)
+ #else
+@@ -583,7 +626,7 @@
+ 
+ 	/* process netlink message pointed by skb->data */
+ 	nlh = nlmsg_hdr(skb);
+-	pid = nlh->nlmsg_pid;
++	pid = NETLINK_CB(__skb).portid;
+ 	seq = nlh->nlmsg_seq;
+ 	msghdr = NLMSG_DATA(nlh);
+ 	msghdr->status = MC_STATUS_SUCCESS;
+@@ -890,6 +933,7 @@
+ 	switch (event_type) {
+ 	case MC_EVENT_MDB_UPDATED:
+ 		data = NLMSG_DATA(nlh);
++		memset(data, 0, MC_MSG_HDRLEN);
+ 		memcpy(data->if_name, mc->dev->name, IFNAMSIZ);
+ 		break;
+ 

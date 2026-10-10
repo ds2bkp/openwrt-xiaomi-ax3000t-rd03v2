@@ -1,0 +1,176 @@
+ecm: map IPv4 multicast VLAN tags to the DSA conduit
+
+Use bridge/standalone tag_8021q VIDs, compact duplicate switch outputs,
+and reconstruct DSA flows on membership changes. Unknown VLAN-aware
+bridge mappings remain in software.
+
+--- a/frontends/nss/ecm_nss_multicast_ipv4.c
++++ b/frontends/nss/ecm_nss_multicast_ipv4.c
+@@ -362,6 +362,46 @@
+ 	 */
+ 	ecm_front_end_connection_deref(feci);
+ 	ecm_db_connection_deref(ci);
++}
++
++/*
++ * Multicast rules use the same tag_8021q conduit as unicast. A VLAN-aware
++ * DSA bridge without an explicit VLAN hierarchy is ambiguous: keep it
++ * in software instead of guessing its PVID.
++ */
++static int ecm_nss_multicast_ipv4_dsa_tag(struct ecm_db_iface_instance *ii,
++				       uint32_t tag[2])
++{
++	struct net_device *dev;
++	uint16_t vid;
++
++	dev = dev_get_by_index(&init_net, ecm_db_iface_interface_identifier_get(ii));
++	if (!dev)
++		return -ENODEV;
++	rcu_read_lock();
++	vid = ecm_nss_common_dsa_8021q_vid_get(dev);
++#if IS_ENABLED(CONFIG_NET_DSA)
++	if (dsa_user_dev_check(dev)) {
++		struct dsa_port *dp = dsa_port_from_netdev(dev);
++		struct net_device *br = dsa_port_bridge_dev_get(dp);
++
++		if (dp->ds->tag_8021q_ctx && br && br_vlan_enabled(br) &&
++		    tag[0] == ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED) {
++			rcu_read_unlock();
++			dev_put(dev);
++			return -EOPNOTSUPP;
++		}
++	}
++#endif
++	rcu_read_unlock();
++	dev_put(dev);
++	if (!vid)
++		return 0;
++	if (tag[0] != ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED &&
++	    tag[0] != ((ETH_P_8021Q << 16) | vid))
++		return -EOPNOTSUPP;
++	tag[0] = (ETH_P_8021Q << 16) | vid;
++	return 1;
+ }
+ 
+ /*
+@@ -481,8 +521,8 @@
+ 	 */
+ 	for (vif = 0; vif < ECM_DB_MULTICAST_IF_MAX; vif++) {
+ #ifdef ECM_INTERFACE_VLAN_ENABLE
+-		create->if_rule[vif].egress_vlan_tag[0] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
+-		create->if_rule[vif].egress_vlan_tag[1] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
++		create->if_rule[valid_vif_idx].egress_vlan_tag[0] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
++		create->if_rule[valid_vif_idx].egress_vlan_tag[1] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
+ #endif
+ 
+ 		/*
+@@ -644,6 +684,16 @@
+ 		 */
+ 		if (to_nss_iface_id != -1) {
+ 			bool is_bridge;
++			ii_single = ecm_db_multicast_if_instance_get_at_index(ii_temp, *to_ii_first);
++			ret = ecm_nss_multicast_ipv4_dsa_tag(*(struct ecm_db_iface_instance **)ii_single,
++						  create->if_rule[valid_vif_idx].egress_vlan_tag);
++			if (ret < 0) {
++				ecm_db_multicast_connection_to_interfaces_deref_all(to_ifaces, to_ifaces_first);
++				kfree(nim);
++				return -1;
++			}
++			if (ret > 0)
++				create->if_rule[valid_vif_idx].valid_flags |= NSS_IPV4_MC_RULE_CREATE_IF_FLAG_VLAN_VALID;
+ 			create->if_rule[valid_vif_idx].if_num = to_nss_iface_id;
+ 			create->if_rule[valid_vif_idx].if_mtu = to_mtu;
+ 			if (rp->if_join_idx[vif]) {
+@@ -1000,6 +1050,14 @@
+ 		interface_type_counts[ii_type]++;
+ 	}
+ 
++	ret = ecm_nss_multicast_ipv4_dsa_tag(from_ifaces[from_ifaces_first], create->ingress_vlan_tag);
++	if (rule_invalid || ret < 0) {
++		ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
++		kfree(nim);
++		return;
++	}
++	if (ret > 0)
++		create->valid_flags |= NSS_IPV4_MC_RULE_CREATE_FLAG_INGRESS_VLAN_VALID;
+ 	ecm_db_connection_interfaces_deref(from_ifaces, from_ifaces_first);
+ 
+ 	ret = ecm_db_multicast_connection_to_interfaces_get_and_ref_all(feci->ci, &to_ifaces, &to_ifaces_first);
+@@ -1024,8 +1082,8 @@
+ 
+ 		to_nss_iface_id = -1;
+ 
+-		create->if_rule[vif].egress_vlan_tag[0] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
+-		create->if_rule[vif].egress_vlan_tag[1] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
++		create->if_rule[valid_vif_idx].egress_vlan_tag[0] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
++		create->if_rule[valid_vif_idx].egress_vlan_tag[1] = ECM_FRONT_END_VLAN_ID_NOT_CONFIGURED;
+ 
+ 		ii_temp = ecm_db_multicast_if_heirarchy_get(to_ifaces, vif);
+ 		to_ii_first = ecm_db_multicast_if_first_get_at_index(to_ifaces_first, vif);
+@@ -1198,6 +1256,16 @@
+ 		if (to_nss_iface_id != -1) {
+ 			uint32_t xlate_src_ip, src_ip;
+ 			bool is_bridge;
++			ii_single = ecm_db_multicast_if_instance_get_at_index(ii_temp, *to_ii_first);
++			ret = ecm_nss_multicast_ipv4_dsa_tag(*(struct ecm_db_iface_instance **)ii_single,
++						  create->if_rule[valid_vif_idx].egress_vlan_tag);
++			if (ret < 0) {
++				ecm_db_multicast_connection_to_interfaces_deref_all(to_ifaces, to_ifaces_first);
++				kfree(nim);
++				return;
++			}
++			if (ret > 0)
++				create->if_rule[valid_vif_idx].valid_flags |= NSS_IPV4_MC_RULE_CREATE_IF_FLAG_VLAN_VALID;
+ 			ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM_NAT, addr);
+ 			ECM_IP_ADDR_TO_HIN4_ADDR(xlate_src_ip, addr);
+ 			ecm_db_connection_address_get(feci->ci, ECM_DB_OBJ_DIR_FROM, addr);
+@@ -1251,7 +1319,20 @@
+ 				}
+ 			}
+ #endif
+-			valid_vif_idx++;
++			/*
++			 * Bridge DSA ports share a conduit and bridge VID. The switch
++			 * MDB replicates the multicast MAC; do not ask NSS to send
++			 * identical copies for every logical switch port.
++			 */
++			for (ret = 0; ret < valid_vif_idx; ret++) {
++				if (!memcmp(&create->if_rule[ret], &create->if_rule[valid_vif_idx],
++					    sizeof(create->if_rule[ret])))
++					break;
++			}
++			if (ret == valid_vif_idx)
++				valid_vif_idx++;
++			else
++				memset(&create->if_rule[valid_vif_idx], 0, sizeof(create->if_rule[valid_vif_idx]));
+ 		}
+ 	}
+ 
+@@ -1920,6 +2001,27 @@
+ 
+ 		feci = ecm_db_connection_front_end_get_and_ref(ci);
+ 
++#if IS_ENABLED(CONFIG_NET_DSA)
++		{
++			struct net_device *lower;
++			struct list_head *iter;
++			bool dsa_bridge = false;
++
++			rcu_read_lock();
++			netdev_for_each_lower_dev(brdev, lower, iter) {
++				if (dsa_user_dev_check(lower)) {
++					dsa_bridge = true;
++					break;
++				}
++			}
++			rcu_read_unlock();
++			if (dsa_bridge) {
++				ecm_db_connection_make_defunct(ci);
++				ecm_front_end_connection_deref(feci);
++				goto find_next_tuple;
++			}
++		}
++#endif
+ 		/*
+ 		 * All bridge slaves have left the group. If flow is pure bridge, decel the connection and return.
+ 		 * If flow is routed, let MFC callback handle this.

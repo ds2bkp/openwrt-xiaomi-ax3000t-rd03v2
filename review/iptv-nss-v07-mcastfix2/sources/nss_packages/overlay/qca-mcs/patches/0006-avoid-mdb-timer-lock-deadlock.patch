@@ -1,0 +1,79 @@
+qca-mcs: avoid waiting for MDB timers while holding mc->lock
+
+The expiry callback takes mc->lock too. Defer active-timer cleanup and
+quiesce all timers before flushing the detached snooper.
+
+--- a/mc_snooping.c
++++ b/mc_snooping.c
+@@ -633,24 +633,28 @@
+ /* mc_mdb_destroy
+  *	destroy the mdb
+  */
+-static void mc_mdb_destroy(struct mc_mdb_entry *mdb)
++static bool mc_mdb_destroy(struct mc_mdb_entry *mdb)
+ {
+ 	struct hlist_node *h;
+ 	struct mc_port_group *pg;
+ 
++	/* The timer callback also takes mc->lock: never wait while holding it. */
++	if (try_to_del_timer_sync(&mdb->etimer) < 0)
++		return false;
++
+ 	os_hlist_for_each_entry_rcu(pg, h, &mdb->pslist, pslist) {
+ 
+ 		mc_port_group_destroy(pg);
+ 	}
+ 
+ 	hlist_del_rcu(&mdb->hlist);
+-	del_timer_sync(&mdb->etimer);
+ 
+ 	if (mdb->flood_ifcnt != 0) {
+ 		mc_group_notify_one(mdb->mc, &mdb->group);
+ 		mdb->flood_ifcnt = 0;
+ 	}
+ 	call_rcu(&mdb->rcu, mc_mdb_rcu_free);
++	return true;
+ }
+ 
+ /* mc_agingtimer_reset
+@@ -2756,8 +2760,8 @@
+ 
+ /*
+  * mc_mdb_flush
+- *	Flush mdb
+- *	This funciton must be called with spin lock held
++ *	Flush mdb after detach/RCU grace and cancellation of parent timers.
++ *	No mc->lock is held while synchronizing the per-entry timers.
+  */
+ static void mc_mdb_flush(struct mc_struct *mc)
+ {
+@@ -2767,6 +2771,7 @@
+ 		struct mc_mdb_entry *mdb;
+ 		struct hlist_node *h, *n;
+ 		os_hlist_for_each_entry_safe(mdb, h, n, &mc->hash[i], hlist) {
++			del_timer_sync(&mdb->etimer);
+ 			mc_mdb_destroy(mdb);
+ 		}
+ 	}
+@@ -2932,6 +2937,11 @@
+ 	spin_lock_bh(&g_mcs_lock);
+ 	mc_forward_exit();
+ 	spin_unlock_bh(&g_mcs_lock);
++	/* Timer handlers use these lists; quiesce them before freeing entries. */
++	del_timer_sync(&mc->qtimer);
++	del_timer_sync(&mc->agingtimer);
++	del_timer_sync(&mc->rtimer);
++	del_timer_sync(&mc->evtimer);
+ 	mc_mdb_flush(mc);
+ 	mc_rlist_flush(mc);
+ 
+@@ -3113,7 +3123,8 @@
+ 			unsigned long expire_time = mc->membership_interval;
+ 
+ 			if (hlist_empty(&mdb->pslist)) {
+-				mc_mdb_destroy(mdb);
++				if (!mc_mdb_destroy(mdb))
++					next_timer = now + HZ;
+ 				continue;
+ 			}
+ 
